@@ -1,17 +1,16 @@
 """Live integration test for SPEC acceptance scenario 1.
 
 Unlike ``test_agent_relay.py`` (which drives the app in-process through
-TestClient), this starts a real uvicorn server in a subprocess, talks to it
-over HTTP, and then inspects the SQLite file directly with ``sqlite3``.  It
-deliberately imports nothing from the app so the server's database is the only
-one involved, and it never touches ``./agent-relay.db``.
+TestClient), this starts a real uvicorn server in a subprocess against its own
+freshly created PostgreSQL database, talks to it over HTTP, and then inspects
+the stored rows directly with psycopg.  It deliberately imports nothing from
+the app so the server's database is the only one involved.
 """
 
 from __future__ import annotations
 
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Iterator
 
 import httpx
+import psycopg
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -32,13 +32,12 @@ def free_port() -> int:
 
 
 @pytest.fixture
-def live_relay(tmp_path: Path) -> Iterator[tuple[str, Path]]:
-    """Run the relay as a separate process against a scratch SQLite file."""
+def live_relay(tmp_path: Path, scratch_database) -> Iterator[tuple[str, str]]:
+    """Run the relay as a separate process against a scratch PostgreSQL database."""
 
-    db_path = tmp_path / "live-relay.db"
     port = free_port()
     base_url = f"http://127.0.0.1:{port}"
-    env = {**os.environ, "RELAY_DATABASE_URL": f"sqlite:///{db_path.as_posix()}"}
+    env = {**os.environ, "RELAY_DATABASE_URL": scratch_database.app_url}
     env.pop("DATABASE_URL", None)
     log_path = tmp_path / "server.log"
     with log_path.open("wb") as log:
@@ -62,7 +61,7 @@ def live_relay(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             if time.monotonic() > deadline:
                 pytest.fail(f"relay not ready after {STARTUP_TIMEOUT_SECONDS}s:\n{log_path.read_text(errors='replace')}")
             time.sleep(0.2)
-        yield base_url, db_path
+        yield base_url, scratch_database.libpq_url
     finally:
         server.terminate()
         try:
@@ -81,7 +80,7 @@ def register(client: httpx.Client, name: str) -> tuple[str, dict[str, str]]:
 
 
 def test_scenario_1_two_agents_exchange_task_and_result(live_relay):
-    base_url, db_path = live_relay
+    base_url, db_url = live_relay
     task_input = "Review this Python function: def add(a, b): return a - b"
     task_output = "Bug: add() subtracts. Use return a + b."
 
@@ -145,13 +144,13 @@ def test_scenario_1_two_agents_exchange_task_and_result(live_relay):
         assert empty.status_code == 204
 
     # The persisted state matches what the API reported.
-    with sqlite3.connect(db_path) as db:
+    with psycopg.connect(db_url) as db:
         rows = db.execute(
-            "SELECT sender_id, recipient_id, status, output, attempt_count FROM tasks WHERE id = ?", (task_id,)
+            "SELECT sender_id, recipient_id, status, output, attempt_count FROM tasks WHERE id = %s", (task_id,)
         ).fetchall()
         assert rows == [(alice_id, bob_id, "completed", task_output, 1)]
         attempt_rows = db.execute(
-            "SELECT attempt_number, worker_id, outcome, claim_token_hash FROM attempts WHERE task_id = ?", (task_id,)
+            "SELECT attempt_number, worker_id, outcome, claim_token_hash FROM attempts WHERE task_id = %s", (task_id,)
         ).fetchall()
         assert len(attempt_rows) == 1
         assert attempt_rows[0][:3] == (1, "bob-laptop-1", "completed")

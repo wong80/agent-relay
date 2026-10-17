@@ -1,19 +1,15 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests for Agent Relay on PostgreSQL.
 
 These tests intentionally exercise storage calls from multiple threads: that
 is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+inbox.  The production guarantee comes from PostgreSQL row locks
+(``FOR UPDATE SKIP LOCKED``), not from a Python lock.
+
+``conftest.py`` points the app at the disposable test database before this
+module imports it.
 """
 
 from __future__ import annotations
-
-import os
-
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -22,14 +18,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
-from storage import claim_one
+from database import Attempt, Base, Task, as_db_time, db_session, engine, init_db, utcnow
+from storage import claim_one, create_task
 
 
 @pytest.fixture(autouse=True)
 def empty_database():
-    # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # conftest.py guarantees this is the dedicated *_test database.
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -98,7 +93,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")
@@ -118,6 +113,31 @@ def test_sqlite_atomic_claims_distribute_without_overlap():
             processing = list(db.query(Task).filter(Task.status == "processing"))
             assert len(processing) == 16
             assert all(task.attempt_count == 1 for task in processing)
+
+
+def test_concurrent_schema_creation_is_safe():
+    # Several replicas starting together all run init_db against an empty database.
+    Base.metadata.drop_all(engine)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: init_db(), range(6)))
+    with db_session() as db:
+        assert db.query(Task).count() == 0
+
+
+def test_concurrent_idempotent_creates_make_one_task():
+    with TestClient(main.app) as client:
+        sender, _sender_headers = register(client, "sender")
+        recipient, _recipient_headers = register(client, "recipient")
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(
+                pool.map(
+                    lambda _: create_task(sender["agent_id"], recipient["agent_id"], "once only", "race-key"),
+                    range(12),
+                )
+            )
+        assert len({result["task_id"] for result in results}) == 1
+        with db_session() as db:
+            assert db.query(Task).filter(Task.idempotency_key == "race-key").count() == 1
 
 
 def test_expiry_requeues_and_old_token_is_stale_before_recovery():

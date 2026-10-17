@@ -1,6 +1,6 @@
 """FastAPI routes for Agent Relay.
 
-Persistence and SQLite transaction details live in :mod:`database` and
+Persistence and PostgreSQL transaction details live in :mod:`database` and
 :mod:`storage`; the deterministic local worker is in :mod:`worker`.
 """
 
@@ -20,7 +20,6 @@ from fastapi import Depends, FastAPI, Header, Path as FastAPIPath, Query, Reques
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
 from database import (
     DEFAULT_PAGE_SIZE,
@@ -205,15 +204,8 @@ async def tasks_create(
         not idempotency_key.strip() or len(idempotency_key) > 255 or "\x00" in idempotency_key
     ):
         raise RelayError("invalid_input", "Idempotency-Key must be nonempty and at most 255 characters.", 400)
-    for retry in range(3):
-        try:
-            result = create_task(current.id, body.to, body.input, idempotency_key)
-            return JSONResponse(status_code=201, content=result)
-        except OperationalError as exc:
-            if retry == 2 or "locked" not in str(exc).lower():
-                raise
-            await asyncio.sleep(0.05 * (retry + 1))
-    raise RelayError("storage_error", "The task could not be persisted.", 503)
+    result = create_task(current.id, body.to, body.input, idempotency_key)
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.post("/api/v1/tasks/claim")
@@ -223,12 +215,7 @@ async def claim(
 ) -> Response:
     deadline = time.monotonic() + body.wait_seconds
     while True:
-        try:
-            result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
-        except OperationalError as exc:
-            if "locked" not in str(exc).lower():
-                raise
-            result = None
+        result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
         if result is not None:
             return JSONResponse(status_code=200, content=result)
         remaining = deadline - time.monotonic()
