@@ -1,0 +1,106 @@
+# The Agent Relay API.  Replicas are safe to scale: claims, heartbeats, terminal
+# submissions, and lease recovery all coordinate through PostgreSQL row locks.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: agent-relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  selector:
+    app.kubernetes.io/name: agent-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: agent-relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-relay
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-relay
+        app.kubernetes.io/part-of: agent-relay
+    spec:
+      securityContext:
+        # The image's `relay` user (uid 999); numeric so runAsNonRoot can verify it.
+        runAsUser: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+      initContainers:
+        # The app creates its tables at startup and exits if the database is
+        # unreachable, so wait for PostgreSQL instead of crash-looping.
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432 -q; do echo waiting for postgres; sleep 2; done"]
+          securityContext:
+            runAsUser: 70
+            runAsGroup: 70
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      containers:
+        - name: agent-relay
+          # Built locally and loaded with `kind load docker-image agent-relay:local`.
+          image: agent-relay:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-relay-db
+                  key: RELAY_DATABASE_URL
+          # /ready queries the real tables: the pod only receives traffic
+          # while it can actually use the database.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /health is process liveness only, so a database outage makes pods
+          # unready rather than restarting them.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
