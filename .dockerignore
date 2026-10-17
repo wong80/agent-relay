@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
+test_*.py
+Dockerfile
+.dockerignore
+conftest.py
+compose.yaml

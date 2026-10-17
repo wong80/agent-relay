@@ -1,0 +1,47 @@
+# Agent Relay + PostgreSQL.
+#
+#   docker compose up -d --build      # API on http://127.0.0.1:8080
+#   docker compose logs -f agent-relay
+#   docker compose down               # keeps data;  add -v to delete it
+#
+# Credentials default to relay/relay for local use.  Override them (and the
+# published ports) with environment variables or a .env file next to this one:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, RELAY_PORT, POSTGRES_PORT
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-relay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_relay}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Published on loopback only, for the test suite and local inspection
+    # (psql, DB tools).  The relay itself reaches it as postgres:5432.
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  agent-relay:
+    build: .
+    image: agent-relay:local
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-relay}:${POSTGRES_PASSWORD:-relay}@postgres:5432/${POSTGRES_DB:-agent_relay}
+      # Set to require X-Enrollment-Secret on registration (recommended when shared).
+      RELAY_ENROLLMENT_SECRET: ${RELAY_ENROLLMENT_SECRET:-}
+    ports:
+      - "${RELAY_PORT:-8080}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
