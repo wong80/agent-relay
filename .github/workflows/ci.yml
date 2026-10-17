@@ -1,0 +1,127 @@
+# Test Agent Relay against PostgreSQL, then build a uniquely tagged image and
+# roll it out to the local kind cluster -- only if every test passed.
+#
+# Run locally with act (settings come from .actrc):
+#   act push
+#
+# The deploy job targets a kind cluster on the machine running the workflow, so
+# it only runs when the DEPLOY_TO_KIND variable is "true" (.actrc sets it for
+# act).  On GitHub-hosted runners the test job still runs and deploy is skipped.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Running the job in a container makes the database reachable by its
+    # service name (`postgres`) both on GitHub and under act.
+    container: python:3.11-slim
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: agent_relay
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      RELAY_TEST_DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/agent_relay_test
+      UV_LINK_MODE: copy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install --no-cache-dir uv==0.11.29
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      - name: Protocol tests
+        run: uv run --frozen pytest -v test_agent_relay.py
+
+      - name: Live integration test (real server + PostgreSQL)
+        run: uv run --frozen pytest -v test_integration_live.py
+
+  deploy:
+    needs: test
+    if: ${{ vars.DEPLOY_TO_KIND == 'true' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    env:
+      KIND_CLUSTER: agent-relay
+      KIND_VERSION: v0.33.0
+      KUBECTL_VERSION: v1.36.1
+      NAMESPACE: agent-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind and kubectl
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSLo "$HOME/bin/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x "$HOME/bin/kind" "$HOME/bin/kubectl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Connect to the kind cluster
+        run: |
+          set -euo pipefail
+          kind get clusters | grep -qx "$KIND_CLUSTER" \
+            || { echo "::error::kind cluster '$KIND_CLUSTER' not found"; exit 1; }
+          # The job runs in a container, where the host's 127.0.0.1 API address
+          # is unreachable.  Talk to the control-plane node by its IP on kind's
+          # Docker network instead: reachable from act's default host network,
+          # or after joining the kind network when running on a bridge.
+          docker network connect kind "$(hostname)" 2>/dev/null \
+            || echo "Not joining the kind network (host networking); using the node IP directly."
+          node="${KIND_CLUSTER}-control-plane"
+          node_ip=$(docker inspect -f '{{ (index .NetworkSettings.Networks "kind").IPAddress }}' "$node")
+          mkdir -p "$HOME/.kube"
+          kind get kubeconfig --internal --name "$KIND_CLUSTER" > "$HOME/.kube/config"
+          # Keep verifying the API server certificate under its real name.
+          kubectl config set-cluster "kind-${KIND_CLUSTER}" \
+            --server="https://${node_ip}:6443" --tls-server-name="$node"
+          kubectl cluster-info
+
+      - name: Choose a unique image tag
+        id: tag
+        run: |
+          # Commit + UTC timestamp: unique per run, even when rebuilding the
+          # same commit with uncommitted local changes under act.
+          echo "tag=$(echo "$GITHUB_SHA" | cut -c1-12)-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "agent-relay:${{ steps.tag.outputs.tag }}" .
+
+      - name: Load image into kind
+        run: kind load docker-image "agent-relay:${{ steps.tag.outputs.tag }}" --name "$KIND_CLUSTER"
+
+      - name: Deploy and wait for rollout
+        run: |
+          set -euo pipefail
+          # Render the manifests with the new tag so one apply triggers one rollout.
+          kubectl kustomize k8s \
+            | sed "s#image: agent-relay:local#image: agent-relay:${{ steps.tag.outputs.tag }}#" \
+            | kubectl apply -f -
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
+          kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s
+
+      - name: Show deployed version
+        if: always()
+        run: |
+          kubectl -n "$NAMESPACE" get deployment agent-relay \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' || true
+          kubectl -n "$NAMESPACE" get pods -o wide || true

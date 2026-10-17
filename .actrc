@@ -1,0 +1,4 @@
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+--var DEPLOY_TO_KIND=true
+--container-daemon-socket unix:///var/run/docker.sock
+--pull=false
